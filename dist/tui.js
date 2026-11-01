@@ -132,580 +132,589 @@ export function writeClipboard(text) {
 export default Plugin.define({
     id: "compressor.tui",
     async setup(context) {
-        const client = context.client.rpc(Compressor);
-        let last;
-        const toast = (message, variant = "info") => context.ui.toast.show({ title: "Compressor", message, variant, duration: variant === "error" ? 8000 : 4000 });
-        function currentSessionID() {
-            try {
-                const route = context.ui.router.current();
-                if (route.type === "session")
-                    return route.sessionID;
+        try {
+            return await install(context);
+        }
+        catch (error) {
+            console.error(`[compressor] TUI setup failed: ${error instanceof Error ? error.message : String(error)}`);
+            return () => { };
+        }
+    },
+});
+async function install(context) {
+    const client = context.client.rpc(Compressor);
+    let last;
+    const toast = (message, variant = "info") => context.ui.toast.show({ title: "Compressor", message, variant, duration: variant === "error" ? 8000 : 4000 });
+    function currentSessionID() {
+        try {
+            const route = context.ui.router.current();
+            if (route.type === "session")
+                return route.sessionID;
+        }
+        catch {
+            // Router not ready.
+        }
+        return undefined;
+    }
+    function location() {
+        const sessionID = currentSessionID();
+        const info = sessionID ? context.data.session.get(sessionID) : undefined;
+        return info?.location ?? context.location ?? context.data.location.default();
+    }
+    const directory = () => String(location()?.directory ?? process.cwd());
+    const call = async (method, input = {}) => {
+        const result = await client[method](input, { location: location() });
+        if (result && typeof result === "object" && typeof result.type === "string" && typeof result.message === "string" && !("tokens" in result) && !("compressed" in result)) {
+            throw new Error(result.message);
+        }
+        return result;
+    };
+    const unsubscribe = client.events?.on?.("status", (event) => {
+        const message = event?.data?.message;
+        if (typeof message === "string")
+            toast(message, /fail|skipped|error/i.test(message) ? "warning" : "info");
+    });
+    /** Ask where the input comes from. Returns {text} or {path}. */
+    async function chooseInput(title) {
+        const choice = await context.ui.dialog.select({
+            title,
+            options: [
+                { title: "Paste from clipboard", value: "clipboard", description: "Reads the system clipboard (multi-line safe)" },
+                { title: "Read from file…", value: "file", description: "Path relative to the project, ~ supported" },
+                { title: "Type or paste a single line…", value: "line" },
+                ...(last ? [{ title: "Last compressed result", value: "last", description: `${last.compressedTokens} tokens` }] : []),
+                {
+                    title: "Tip: /compress <text>",
+                    value: "tip",
+                    description: "Multi-line text can also be pasted straight after the slash command",
+                    disabled: true,
+                },
+            ],
+        });
+        if (!choice)
+            return undefined;
+        if (choice === "clipboard") {
+            const text = readClipboard();
+            if (!text?.trim()) {
+                toast("Clipboard is empty or no clipboard tool was found (wl-paste, xclip, xsel, pbpaste, powershell.exe)", "warning");
+                return undefined;
             }
-            catch {
-                // Router not ready.
+            return { text };
+        }
+        if (choice === "file") {
+            const file = await context.ui.dialog.prompt({ title: "File to read", placeholder: "./prompt.md" });
+            return file?.trim() ? { path: file.trim().replace(/^@/, "") } : undefined;
+        }
+        if (choice === "last")
+            return { text: last.compressed };
+        const text = await context.ui.dialog.prompt({ title: "Text", placeholder: "Prompt text" });
+        return text?.trim() ? { text } : undefined;
+    }
+    function sourceFrom(parsed) {
+        if (parsed.file)
+            return { path: parsed.file };
+        if (!parsed.rest.trim())
+            return undefined;
+        if (looksLikeFile(parsed.rest, directory()))
+            return { path: parsed.rest.trim().replace(/^@/, "") };
+        return { text: parsed.rest };
+    }
+    async function tokens(input) {
+        const parsed = parseArgs(input ?? "");
+        const source = sourceFrom(parsed) ?? (await chooseInput("Count tokens"));
+        if (!source)
+            return;
+        const result = await call("count", { ...source, model: parsed.model });
+        await context.ui.dialog.alert({ title: "Token count", message: formatCount(result) });
+    }
+    function preview(text) {
+        return text.length > PREVIEW_CHARS ? `${text.slice(0, PREVIEW_CHARS)}\n… (${text.length - PREVIEW_CHARS} more characters)` : text;
+    }
+    async function resultMenu(result) {
+        for (;;) {
+            const sessionID = currentSessionID();
+            const action = await context.ui.dialog.select({
+                title: `Compressed ${result.originalTokens} → ${result.compressedTokens} tokens (${result.ratio.toFixed(2)}×)`,
+                options: [
+                    { title: "Show summary", value: "summary", description: result.engine },
+                    { title: "Show compressed text", value: "compressed" },
+                    { title: "Show original text", value: "original" },
+                    { title: "Copy compressed text to clipboard", value: "copy" },
+                    { title: "Write compressed text to file…", value: "write" },
+                    ...(sessionID
+                        ? [{ title: "Send compressed text to this session", value: "send", description: "Submits it as your next message" }]
+                        : []),
+                    { title: "Recompress with different settings…", value: "again" },
+                    { title: "Done", value: "done" },
+                ],
+            });
+            if (!action || action === "done")
+                return;
+            if (action === "summary")
+                await context.ui.dialog.alert({ title: "Compression", message: formatSummary(result) });
+            if (action === "compressed")
+                await context.ui.dialog.alert({ title: "Compressed", message: preview(result.compressed) });
+            if (action === "original")
+                await context.ui.dialog.alert({ title: "Original", message: preview(result.original) });
+            if (action === "copy") {
+                if (writeClipboard(result.compressed))
+                    toast("Compressed text copied", "success");
+                else
+                    toast("No clipboard tool found (wl-copy, xclip, xsel, pbcopy, powershell.exe)", "error");
             }
+            if (action === "write") {
+                const file = await context.ui.dialog.prompt({
+                    title: "Write compressed text to",
+                    value: result.file ? result.file.replace(/(\.[^./]+)?$/, ".compressed$1") : "prompt.compressed.md",
+                });
+                if (!file?.trim())
+                    continue;
+                const written = await call("writeFile", { path: file.trim(), text: result.compressed });
+                toast(`Written to ${written.path}`, "success");
+            }
+            if (action === "send" && sessionID) {
+                const confirmed = await context.ui.dialog.confirm({
+                    title: "Send compressed prompt",
+                    message: `Send ${result.compressedTokens} tokens of compressed text to this session as your next message?`,
+                    label: { confirm: "Send", cancel: "Cancel" },
+                });
+                if (!confirmed)
+                    continue;
+                await call("send", { sessionID, text: result.compressed });
+                toast("Sent", "success");
+                return;
+            }
+            if (action === "again") {
+                const rate = await context.ui.dialog.prompt({
+                    title: "Keep rate (0.05–1)",
+                    description: "Fraction of tokens to keep. 0.5 = 2×, 0.33 = 3×",
+                    value: String(result.amount.match(/keep (\d+)%/)?.[1] ? Number(result.amount.match(/keep (\d+)%/)[1]) / 100 : 0.5),
+                });
+                if (!rate?.trim() || !Number.isFinite(Number(rate)))
+                    continue;
+                toast("Compressing…");
+                result = await call("compress", { text: result.original, overrides: { rate: Number(rate) } });
+                last = result;
+            }
+        }
+    }
+    async function compress(input) {
+        const parsed = parseArgs(input ?? "");
+        const source = sourceFrom(parsed) ?? (await chooseInput("Compress prompt"));
+        if (!source)
+            return;
+        toast("Compressing… (the first run loads the model)");
+        const result = await call("compress", {
+            ...source,
+            writeTo: parsed.out,
+            overrides: parsed.overrides,
+        });
+        last = result;
+        if (result.written)
+            toast(`Written to ${result.written}`, "success");
+        await resultMenu(result);
+    }
+    // ---------- settings ----------
+    const onOff = (value) => (value ? "on" : "off");
+    async function promptNumber(title, current, description) {
+        const answer = await context.ui.dialog.prompt({ title, description, value: String(current) });
+        if (answer === undefined || !answer.trim())
+            return undefined;
+        const value = Number(answer);
+        if (!Number.isFinite(value)) {
+            toast(`Not a number: ${answer}`, "error");
             return undefined;
         }
-        function location() {
-            const sessionID = currentSessionID();
-            const info = sessionID ? context.data.session.get(sessionID) : undefined;
-            return info?.location ?? context.location ?? context.data.location.default();
-        }
-        const directory = () => String(location()?.directory ?? process.cwd());
-        const call = async (method, input = {}) => {
-            const result = await client[method](input, { location: location() });
-            if (result && typeof result === "object" && typeof result.type === "string" && typeof result.message === "string" && !("tokens" in result) && !("compressed" in result)) {
-                throw new Error(result.message);
-            }
-            return result;
-        };
-        const unsubscribe = client.events?.on?.("status", (event) => {
-            const message = event?.data?.message;
-            if (typeof message === "string")
-                toast(message, /fail|skipped|error/i.test(message) ? "warning" : "info");
+        return value;
+    }
+    async function promptText(title, current, description) {
+        const answer = await context.ui.dialog.prompt({ title, description, value: current });
+        return answer === undefined ? undefined : answer;
+    }
+    async function pickOne(title, current, values, describe) {
+        return context.ui.dialog.select({
+            title,
+            current,
+            options: values.map((value) => ({ title: value, value, description: describe?.(value) })),
         });
-        /** Ask where the input comes from. Returns {text} or {path}. */
-        async function chooseInput(title) {
-            const choice = await context.ui.dialog.select({
-                title,
-                options: [
-                    { title: "Paste from clipboard", value: "clipboard", description: "Reads the system clipboard (multi-line safe)" },
-                    { title: "Read from file…", value: "file", description: "Path relative to the project, ~ supported" },
-                    { title: "Type or paste a single line…", value: "line" },
-                    ...(last ? [{ title: "Last compressed result", value: "last", description: `${last.compressedTokens} tokens` }] : []),
-                    {
-                        title: "Tip: /compress <text>",
-                        value: "tip",
-                        description: "Multi-line text can also be pasted straight after the slash command",
-                        disabled: true,
-                    },
-                ],
+    }
+    async function pickLocalModel(settings) {
+        const two = settings.engine === "llmlingua2" || settings.engine === "cloud";
+        const list = two ? LLMLINGUA2_MODELS : LLMLINGUA_MODELS;
+        const key = two ? "llmlingua2" : "llmlingua";
+        const current = settings.models[key];
+        const choice = await context.ui.dialog.select({
+            title: two ? "LLMLingua-2 model" : "LLMLingua / LongLLMLingua model",
+            current,
+            options: [
+                ...list.map((model) => ({ title: model.title, value: model.id, description: `${model.id} · ${model.description}` })),
+                ...(list.some((model) => model.id === current) ? [] : [{ title: `Custom: ${current}`, value: current }]),
+                { title: "Custom HuggingFace model ID…", value: "__custom__" },
+            ],
+        });
+        if (!choice)
+            return undefined;
+        let model = choice;
+        if (choice === "__custom__") {
+            const answer = await context.ui.dialog.prompt({
+                title: "HuggingFace model ID",
+                description: two ? "A token-classification model trained for LLMLingua-2" : "A causal language model",
+                value: current,
             });
-            if (!choice)
+            if (!answer?.trim())
                 return undefined;
-            if (choice === "clipboard") {
-                const text = readClipboard();
-                if (!text?.trim()) {
-                    toast("Clipboard is empty or no clipboard tool was found (wl-paste, xclip, xsel, pbpaste, powershell.exe)", "warning");
+            model = answer.trim();
+        }
+        return { models: { [key]: model } };
+    }
+    async function pickCloudModel(settings) {
+        const loc = location();
+        await context.data.location.model.sync(loc).catch(() => undefined);
+        const models = (context.data.location.model.list(loc) ?? []);
+        if (!models.length) {
+            toast("No models are available in this OpenCode session", "warning");
+            return undefined;
+        }
+        const current = settings.cloudModel ? `${settings.cloudModel.providerID}/${settings.cloudModel.id}` : undefined;
+        const choice = await context.ui.dialog.select({
+            title: "Cloud model used for compression",
+            placeholder: "Search models (cheap and fast is best, e.g. Haiku)",
+            current,
+            options: models
+                .filter((model) => model.enabled !== false)
+                .map((model) => {
+                const cost = model.cost?.[0];
+                const price = cost ? `$${cost.input}/M in · $${cost.output}/M out` : "price unknown";
+                return {
+                    title: model.name ?? model.id,
+                    value: `${model.providerID}/${model.id}`,
+                    description: `${model.providerID}/${model.id} · ${price}`,
+                    category: model.providerID,
+                };
+            }),
+            search: (query, options) => {
+                const needle = query.trim().toLowerCase();
+                if (!needle)
+                    return options;
+                return options.filter((option) => option.title.toLowerCase().includes(needle) || (option.description ?? "").toLowerCase().includes(needle));
+            },
+        });
+        if (!choice)
+            return undefined;
+        const slash = choice.indexOf("/");
+        return { cloudModel: { providerID: choice.slice(0, slash), id: choice.slice(slash + 1) }, engine: "cloud" };
+    }
+    async function editSetting(key, settings) {
+        const s = settings;
+        switch (key) {
+            case "engine": {
+                const engine = await context.ui.dialog.select({
+                    title: "Compression engine",
+                    current: s.engine,
+                    options: Object.keys(ENGINES).map((value) => ({
+                        title: ENGINES[value].title,
+                        value,
+                        description: ENGINES[value].description,
+                    })),
+                });
+                if (!engine)
                     return undefined;
-                }
-                return { text };
+                if (engine === "cloud" && !s.cloudModel)
+                    return pickCloudModel(s);
+                return { engine };
             }
-            if (choice === "file") {
-                const file = await context.ui.dialog.prompt({ title: "File to read", placeholder: "./prompt.md" });
-                return file?.trim() ? { path: file.trim().replace(/^@/, "") } : undefined;
+            case "model":
+                return pickLocalModel(s);
+            case "cloudModel":
+                return pickCloudModel(s);
+            case "device": {
+                const device = await pickOne("Device", s.device, ["auto", "cuda", "cpu", "mps"], (value) => value === "auto" ? "CUDA if available, then MPS, else CPU" : "");
+                return device ? { device } : undefined;
             }
-            if (choice === "last")
-                return { text: last.compressed };
-            const text = await context.ui.dialog.prompt({ title: "Text", placeholder: "Prompt text" });
-            return text?.trim() ? { text } : undefined;
+            case "preset": {
+                const preset = await context.ui.dialog.select({
+                    title: "Compression preset",
+                    options: Object.keys(PRESETS).map((name) => ({
+                        title: PRESETS[name].title,
+                        value: name,
+                        description: PRESETS[name].description,
+                    })),
+                });
+                return preset ? { amount: { mode: "rate", rate: PRESETS[preset].rate } } : undefined;
+            }
+            case "mode": {
+                const mode = await pickOne("Amount mode", s.amount.mode, ["rate", "target"], (value) => value === "rate" ? "Keep a fraction of tokens" : "Aim for an absolute token count");
+                return mode ? { amount: { mode } } : undefined;
+            }
+            case "rate": {
+                const rate = await promptNumber("Rate (fraction kept)", s.amount.rate, "0.05–1. 0.5 = 2×, 0.33 = 3×, 0.2 = 5×");
+                return rate === undefined ? undefined : { amount: { mode: "rate", rate } };
+            }
+            case "targetToken": {
+                const targetToken = await promptNumber("Target tokens", s.amount.targetToken, "Absolute token budget for the result");
+                return targetToken === undefined ? undefined : { amount: { mode: "target", targetToken } };
+            }
+            case "forceTokens": {
+                const answer = await promptText("Protected tokens", encodeTokens(s.protect.forceTokens), "Comma separated. Use \\n for newline, \\t for tab, \\, for a comma");
+                return answer === undefined ? undefined : { protect: { forceTokens: decodeTokens(answer) } };
+            }
+            case "forceReserveDigit":
+            case "dropConsecutive":
+            case "keepCode":
+                return { protect: { [key]: !s.protect[key] } };
+            case "minSegmentChars": {
+                const value = await promptNumber("Minimum segment length", s.protect.minSegmentChars, "Shorter text segments are left untouched (characters)");
+                return value === undefined ? undefined : { protect: { minSegmentChars: value } };
+            }
+            case "question":
+            case "instruction":
+            case "contextBudget": {
+                const descriptions = {
+                    question: "LongLLMLingua keeps content relevant to this question. Empty for none.",
+                    instruction: "Instruction kept verbatim and used for conditioning. Empty for none.",
+                    contextBudget: 'Extra budget for context-level filtering, e.g. "+100" or "*1.5"',
+                };
+                const answer = await promptText(key, s.longContext[key], descriptions[key]);
+                return answer === undefined ? undefined : { longContext: { [key]: answer } };
+            }
+            case "conditionInQuestion": {
+                const value = await pickOne("condition_in_question", s.longContext.conditionInQuestion, ["none", "before", "after", "after_condition"]);
+                return value ? { longContext: { conditionInQuestion: value } } : undefined;
+            }
+            case "reorderContext": {
+                const value = await pickOne("reorder_context", s.longContext.reorderContext, ["original", "sort", "two_stage"]);
+                return value ? { longContext: { reorderContext: value } } : undefined;
+            }
+            case "rankMethod": {
+                const value = await pickOne("rank_method", s.longContext.rankMethod, ["longllmlingua", "llmlingua", "bm25", "gzip", "sentbert", "openai", "bge", "jinza"], (value) => (["sentbert", "openai", "bge", "jinza"].includes(value) ? "Needs extra packages or API keys in the worker env" : ""));
+                return value ? { longContext: { rankMethod: value } } : undefined;
+            }
+            case "dynamicContextCompressionRatio": {
+                const value = await promptNumber("dynamic_context_compression_ratio", s.longContext.dynamicContextCompressionRatio, "0–1; 0.3–0.4 recommended");
+                return value === undefined ? undefined : { longContext: { dynamicContextCompressionRatio: value } };
+            }
+            case "conditionCompare":
+                return { longContext: { conditionCompare: !s.longContext.conditionCompare } };
+            case "useSentenceLevelFilter":
+            case "useContextLevelFilter":
+            case "useTokenLevelFilter":
+            case "keepSplit":
+                return { filters: { [key]: !s.filters[key] } };
+            case "iterativeSize": {
+                const value = await promptNumber("iterative_size", s.filters.iterativeSize, "Tokens per iterative compression window");
+                return value === undefined ? undefined : { filters: { iterativeSize: value } };
+            }
+            case "countModel": {
+                const answer = await promptText("Counting model", s.counting.model, "Anthropic model ID passed to count_tokens");
+                return answer?.trim() ? { counting: { model: answer.trim() } } : undefined;
+            }
+            case "vaultEntry": {
+                const answer = await promptText("API key vault entry", s.counting.vaultEntry, "env-manager vault entry holding an Anthropic API key");
+                return answer === undefined ? undefined : { counting: { vaultEntry: answer.trim() } };
+            }
+            case "fallbackInputPrice": {
+                const value = await promptNumber("Fallback input price ($/M tokens)", s.counting.fallbackInputPrice, "Used when OpenCode has no price for the counting model");
+                return value === undefined ? undefined : { counting: { fallbackInputPrice: value } };
+            }
+            case "autoEnabled":
+                return { auto: { enabled: !s.auto.enabled } };
+            case "autoMinTokens": {
+                const value = await promptNumber("Auto-compress threshold", s.auto.minTokens, "Only prompts estimated above this many tokens are compressed");
+                return value === undefined ? undefined : { auto: { minTokens: value } };
+            }
         }
-        function sourceFrom(parsed) {
-            if (parsed.file)
-                return { path: parsed.file };
-            if (!parsed.rest.trim())
-                return undefined;
-            if (looksLikeFile(parsed.rest, directory()))
-                return { path: parsed.rest.trim().replace(/^@/, "") };
-            return { text: parsed.rest };
-        }
-        async function tokens(input) {
-            const parsed = parseArgs(input ?? "");
-            const source = sourceFrom(parsed) ?? (await chooseInput("Count tokens"));
-            if (!source)
-                return;
-            const result = await call("count", { ...source, model: parsed.model });
-            await context.ui.dialog.alert({ title: "Token count", message: formatCount(result) });
-        }
-        function preview(text) {
-            return text.length > PREVIEW_CHARS ? `${text.slice(0, PREVIEW_CHARS)}\n… (${text.length - PREVIEW_CHARS} more characters)` : text;
-        }
-        async function resultMenu(result) {
-            for (;;) {
-                const sessionID = currentSessionID();
-                const action = await context.ui.dialog.select({
-                    title: `Compressed ${result.originalTokens} → ${result.compressedTokens} tokens (${result.ratio.toFixed(2)}×)`,
-                    options: [
-                        { title: "Show summary", value: "summary", description: result.engine },
-                        { title: "Show compressed text", value: "compressed" },
-                        { title: "Show original text", value: "original" },
-                        { title: "Copy compressed text to clipboard", value: "copy" },
-                        { title: "Write compressed text to file…", value: "write" },
-                        ...(sessionID
-                            ? [{ title: "Send compressed text to this session", value: "send", description: "Submits it as your next message" }]
+        return undefined;
+    }
+    async function settingsMenu() {
+        let selected;
+        for (;;) {
+            const s = await call("getSettings");
+            const local = s.engine !== "cloud";
+            const long = s.engine === "longllmlingua";
+            const classic = s.engine === "llmlingua" || long;
+            const localModelID = s.engine === "llmlingua2" ? s.models.llmlingua2 : s.models.llmlingua;
+            const options = [
+                { title: `Engine: ${ENGINES[s.engine].title}`, value: "engine", description: ENGINES[s.engine].description, category: "Engine" },
+                ...(local
+                    ? [
+                        { title: `Local model: ${localModelID.split("/").pop()}`, value: "model", description: localModelID, category: "Engine" },
+                        { title: `Device: ${s.device}`, value: "device", category: "Engine" },
+                    ]
+                    : []),
+                {
+                    title: `Cloud model: ${s.cloudModel ? `${s.cloudModel.providerID}/${s.cloudModel.id}` : "not set"}`,
+                    value: "cloudModel",
+                    description: "Pick from the models available to this OpenCode session",
+                    category: "Engine",
+                },
+                { title: "Apply preset…", value: "preset", description: "Light / Balanced / Aggressive / Extreme", category: "Amount" },
+                { title: `Mode: ${s.amount.mode}`, value: "mode", description: describeAmount(s), category: "Amount" },
+                { title: `Rate: ${s.amount.rate}`, value: "rate", description: `≈${(1 / s.amount.rate).toFixed(1)}× compression`, category: "Amount" },
+                { title: `Target tokens: ${s.amount.targetToken}`, value: "targetToken", category: "Amount" },
+                { title: `Keep code blocks verbatim: ${onOff(s.protect.keepCode)}`, value: "keepCode", category: "Protection" },
+                { title: `Protected tokens: ${encodeTokens(s.protect.forceTokens) || "none"}`, value: "forceTokens", category: "Protection" },
+                ...(s.engine === "llmlingua2"
+                    ? [
+                        { title: `Keep digits: ${onOff(s.protect.forceReserveDigit)}`, value: "forceReserveDigit", category: "Protection" },
+                        { title: `Drop consecutive protected tokens: ${onOff(s.protect.dropConsecutive)}`, value: "dropConsecutive", category: "Protection" },
+                    ]
+                    : []),
+                ...(local
+                    ? [{ title: `Minimum segment length: ${s.protect.minSegmentChars} chars`, value: "minSegmentChars", category: "Protection" }]
+                    : []),
+                ...(classic || s.engine === "cloud"
+                    ? [{ title: `Question: ${s.longContext.question || "(none)"}`, value: "question", category: "Long context" }]
+                    : []),
+                ...(classic
+                    ? [{ title: `Instruction: ${s.longContext.instruction || "(none)"}`, value: "instruction", category: "Long context" }]
+                    : []),
+                ...(long
+                    ? [
+                        { title: `condition_in_question: ${s.longContext.conditionInQuestion}`, value: "conditionInQuestion", category: "Long context" },
+                        { title: `reorder_context: ${s.longContext.reorderContext}`, value: "reorderContext", category: "Long context" },
+                        { title: `rank_method: ${s.longContext.rankMethod}`, value: "rankMethod", category: "Long context" },
+                        {
+                            title: `dynamic_context_compression_ratio: ${s.longContext.dynamicContextCompressionRatio}`,
+                            value: "dynamicContextCompressionRatio",
+                            category: "Long context",
+                        },
+                        { title: `context_budget: ${s.longContext.contextBudget}`, value: "contextBudget", category: "Long context" },
+                        { title: `condition_compare: ${onOff(s.longContext.conditionCompare)}`, value: "conditionCompare", category: "Long context" },
+                    ]
+                    : []),
+                ...(local
+                    ? [{ title: `Token-level filter: ${onOff(s.filters.useTokenLevelFilter)}`, value: "useTokenLevelFilter", category: "Filters" }]
+                    : []),
+                ...(classic
+                    ? [
+                        { title: `Sentence-level filter: ${onOff(s.filters.useSentenceLevelFilter)}`, value: "useSentenceLevelFilter", category: "Filters" },
+                        ...(long
+                            ? [{ title: `Context-level filter: ${onOff(s.filters.useContextLevelFilter)}`, value: "useContextLevelFilter", category: "Filters" }]
                             : []),
-                        { title: "Recompress with different settings…", value: "again" },
-                        { title: "Done", value: "done" },
-                    ],
-                });
-                if (!action || action === "done")
-                    return;
-                if (action === "summary")
-                    await context.ui.dialog.alert({ title: "Compression", message: formatSummary(result) });
-                if (action === "compressed")
-                    await context.ui.dialog.alert({ title: "Compressed", message: preview(result.compressed) });
-                if (action === "original")
-                    await context.ui.dialog.alert({ title: "Original", message: preview(result.original) });
-                if (action === "copy") {
-                    if (writeClipboard(result.compressed))
-                        toast("Compressed text copied", "success");
-                    else
-                        toast("No clipboard tool found (wl-copy, xclip, xsel, pbcopy, powershell.exe)", "error");
-                }
-                if (action === "write") {
-                    const file = await context.ui.dialog.prompt({
-                        title: "Write compressed text to",
-                        value: result.file ? result.file.replace(/(\.[^./]+)?$/, ".compressed$1") : "prompt.compressed.md",
-                    });
-                    if (!file?.trim())
-                        continue;
-                    const written = await call("writeFile", { path: file.trim(), text: result.compressed });
-                    toast(`Written to ${written.path}`, "success");
-                }
-                if (action === "send" && sessionID) {
-                    const confirmed = await context.ui.dialog.confirm({
-                        title: "Send compressed prompt",
-                        message: `Send ${result.compressedTokens} tokens of compressed text to this session as your next message?`,
-                        label: { confirm: "Send", cancel: "Cancel" },
-                    });
-                    if (!confirmed)
-                        continue;
-                    await call("send", { sessionID, text: result.compressed });
-                    toast("Sent", "success");
-                    return;
-                }
-                if (action === "again") {
-                    const rate = await context.ui.dialog.prompt({
-                        title: "Keep rate (0.05–1)",
-                        description: "Fraction of tokens to keep. 0.5 = 2×, 0.33 = 3×",
-                        value: String(result.amount.match(/keep (\d+)%/)?.[1] ? Number(result.amount.match(/keep (\d+)%/)[1]) / 100 : 0.5),
-                    });
-                    if (!rate?.trim() || !Number.isFinite(Number(rate)))
-                        continue;
-                    toast("Compressing…");
-                    result = await call("compress", { text: result.original, overrides: { rate: Number(rate) } });
-                    last = result;
-                }
-            }
-        }
-        async function compress(input) {
-            const parsed = parseArgs(input ?? "");
-            const source = sourceFrom(parsed) ?? (await chooseInput("Compress prompt"));
-            if (!source)
-                return;
-            toast("Compressing… (the first run loads the model)");
-            const result = await call("compress", {
-                ...source,
-                writeTo: parsed.out,
-                overrides: parsed.overrides,
-            });
-            last = result;
-            if (result.written)
-                toast(`Written to ${result.written}`, "success");
-            await resultMenu(result);
-        }
-        // ---------- settings ----------
-        const onOff = (value) => (value ? "on" : "off");
-        async function promptNumber(title, current, description) {
-            const answer = await context.ui.dialog.prompt({ title, description, value: String(current) });
-            if (answer === undefined || !answer.trim())
-                return undefined;
-            const value = Number(answer);
-            if (!Number.isFinite(value)) {
-                toast(`Not a number: ${answer}`, "error");
-                return undefined;
-            }
-            return value;
-        }
-        async function promptText(title, current, description) {
-            const answer = await context.ui.dialog.prompt({ title, description, value: current });
-            return answer === undefined ? undefined : answer;
-        }
-        async function pickOne(title, current, values, describe) {
-            return context.ui.dialog.select({
-                title,
-                current,
-                options: values.map((value) => ({ title: value, value, description: describe?.(value) })),
-            });
-        }
-        async function pickLocalModel(settings) {
-            const two = settings.engine === "llmlingua2" || settings.engine === "cloud";
-            const list = two ? LLMLINGUA2_MODELS : LLMLINGUA_MODELS;
-            const key = two ? "llmlingua2" : "llmlingua";
-            const current = settings.models[key];
+                        { title: `iterative_size: ${s.filters.iterativeSize}`, value: "iterativeSize", category: "Filters" },
+                        { title: `keep_split: ${onOff(s.filters.keepSplit)}`, value: "keepSplit", category: "Filters" },
+                    ]
+                    : []),
+                { title: `Counting model: ${s.counting.model}`, value: "countModel", category: "Token counting" },
+                { title: `API key vault entry: ${s.counting.vaultEntry || "(none)"}`, value: "vaultEntry", category: "Token counting" },
+                { title: `Fallback input price: $${s.counting.fallbackInputPrice}/M`, value: "fallbackInputPrice", category: "Token counting" },
+                { title: `Auto-compress long prompts: ${onOff(s.auto.enabled)}`, value: "autoEnabled", category: "Automatic" },
+                { title: `Auto-compress threshold: ${s.auto.minTokens} tokens`, value: "autoMinTokens", category: "Automatic" },
+                { title: "Status…", value: "__status", category: "Actions" },
+                { title: "Load model now (warm up)", value: "__warmup", category: "Actions" },
+                { title: "Stop worker (free GPU memory)", value: "__stop", category: "Actions" },
+                { title: "Reset all settings to defaults", value: "__reset", category: "Actions" },
+            ];
             const choice = await context.ui.dialog.select({
-                title: two ? "LLMLingua-2 model" : "LLMLingua / LongLLMLingua model",
-                current,
-                options: [
-                    ...list.map((model) => ({ title: model.title, value: model.id, description: `${model.id} · ${model.description}` })),
-                    ...(list.some((model) => model.id === current) ? [] : [{ title: `Custom: ${current}`, value: current }]),
-                    { title: "Custom HuggingFace model ID…", value: "__custom__" },
-                ],
-            });
-            if (!choice)
-                return undefined;
-            let model = choice;
-            if (choice === "__custom__") {
-                const answer = await context.ui.dialog.prompt({
-                    title: "HuggingFace model ID",
-                    description: two ? "A token-classification model trained for LLMLingua-2" : "A causal language model",
-                    value: current,
-                });
-                if (!answer?.trim())
-                    return undefined;
-                model = answer.trim();
-            }
-            return { models: { [key]: model } };
-        }
-        async function pickCloudModel(settings) {
-            const loc = location();
-            await context.data.location.model.sync(loc).catch(() => undefined);
-            const models = (context.data.location.model.list(loc) ?? []);
-            if (!models.length) {
-                toast("No models are available in this OpenCode session", "warning");
-                return undefined;
-            }
-            const current = settings.cloudModel ? `${settings.cloudModel.providerID}/${settings.cloudModel.id}` : undefined;
-            const choice = await context.ui.dialog.select({
-                title: "Cloud model used for compression",
-                placeholder: "Search models (cheap and fast is best, e.g. Haiku)",
-                current,
-                options: models
-                    .filter((model) => model.enabled !== false)
-                    .map((model) => {
-                    const cost = model.cost?.[0];
-                    const price = cost ? `$${cost.input}/M in · $${cost.output}/M out` : "price unknown";
-                    return {
-                        title: model.name ?? model.id,
-                        value: `${model.providerID}/${model.id}`,
-                        description: `${model.providerID}/${model.id} · ${price}`,
-                        category: model.providerID,
-                    };
-                }),
-                search: (query, options) => {
+                title: `Compressor — ${describeEngine(s)} · ${describeAmount(s)}`,
+                placeholder: "Search settings",
+                current: selected,
+                options,
+                search: (query, available) => {
                     const needle = query.trim().toLowerCase();
                     if (!needle)
-                        return options;
-                    return options.filter((option) => option.title.toLowerCase().includes(needle) || (option.description ?? "").toLowerCase().includes(needle));
+                        return available;
+                    return available.filter((option) => option.title.toLowerCase().includes(needle) ||
+                        (option.description ?? "").toLowerCase().includes(needle) ||
+                        (option.category ?? "").toLowerCase().includes(needle));
                 },
             });
             if (!choice)
-                return undefined;
-            const slash = choice.indexOf("/");
-            return { cloudModel: { providerID: choice.slice(0, slash), id: choice.slice(slash + 1) }, engine: "cloud" };
-        }
-        async function editSetting(key, settings) {
-            const s = settings;
-            switch (key) {
-                case "engine": {
-                    const engine = await context.ui.dialog.select({
-                        title: "Compression engine",
-                        current: s.engine,
-                        options: Object.keys(ENGINES).map((value) => ({
-                            title: ENGINES[value].title,
-                            value,
-                            description: ENGINES[value].description,
-                        })),
-                    });
-                    if (!engine)
-                        return undefined;
-                    if (engine === "cloud" && !s.cloudModel)
-                        return pickCloudModel(s);
-                    return { engine };
-                }
-                case "model":
-                    return pickLocalModel(s);
-                case "cloudModel":
-                    return pickCloudModel(s);
-                case "device": {
-                    const device = await pickOne("Device", s.device, ["auto", "cuda", "cpu", "mps"], (value) => value === "auto" ? "CUDA if available, then MPS, else CPU" : "");
-                    return device ? { device } : undefined;
-                }
-                case "preset": {
-                    const preset = await context.ui.dialog.select({
-                        title: "Compression preset",
-                        options: Object.keys(PRESETS).map((name) => ({
-                            title: PRESETS[name].title,
-                            value: name,
-                            description: PRESETS[name].description,
-                        })),
-                    });
-                    return preset ? { amount: { mode: "rate", rate: PRESETS[preset].rate } } : undefined;
-                }
-                case "mode": {
-                    const mode = await pickOne("Amount mode", s.amount.mode, ["rate", "target"], (value) => value === "rate" ? "Keep a fraction of tokens" : "Aim for an absolute token count");
-                    return mode ? { amount: { mode } } : undefined;
-                }
-                case "rate": {
-                    const rate = await promptNumber("Rate (fraction kept)", s.amount.rate, "0.05–1. 0.5 = 2×, 0.33 = 3×, 0.2 = 5×");
-                    return rate === undefined ? undefined : { amount: { mode: "rate", rate } };
-                }
-                case "targetToken": {
-                    const targetToken = await promptNumber("Target tokens", s.amount.targetToken, "Absolute token budget for the result");
-                    return targetToken === undefined ? undefined : { amount: { mode: "target", targetToken } };
-                }
-                case "forceTokens": {
-                    const answer = await promptText("Protected tokens", encodeTokens(s.protect.forceTokens), "Comma separated. Use \\n for newline, \\t for tab, \\, for a comma");
-                    return answer === undefined ? undefined : { protect: { forceTokens: decodeTokens(answer) } };
-                }
-                case "forceReserveDigit":
-                case "dropConsecutive":
-                case "keepCode":
-                    return { protect: { [key]: !s.protect[key] } };
-                case "minSegmentChars": {
-                    const value = await promptNumber("Minimum segment length", s.protect.minSegmentChars, "Shorter text segments are left untouched (characters)");
-                    return value === undefined ? undefined : { protect: { minSegmentChars: value } };
-                }
-                case "question":
-                case "instruction":
-                case "contextBudget": {
-                    const descriptions = {
-                        question: "LongLLMLingua keeps content relevant to this question. Empty for none.",
-                        instruction: "Instruction kept verbatim and used for conditioning. Empty for none.",
-                        contextBudget: 'Extra budget for context-level filtering, e.g. "+100" or "*1.5"',
-                    };
-                    const answer = await promptText(key, s.longContext[key], descriptions[key]);
-                    return answer === undefined ? undefined : { longContext: { [key]: answer } };
-                }
-                case "conditionInQuestion": {
-                    const value = await pickOne("condition_in_question", s.longContext.conditionInQuestion, ["none", "before", "after", "after_condition"]);
-                    return value ? { longContext: { conditionInQuestion: value } } : undefined;
-                }
-                case "reorderContext": {
-                    const value = await pickOne("reorder_context", s.longContext.reorderContext, ["original", "sort", "two_stage"]);
-                    return value ? { longContext: { reorderContext: value } } : undefined;
-                }
-                case "rankMethod": {
-                    const value = await pickOne("rank_method", s.longContext.rankMethod, ["longllmlingua", "llmlingua", "bm25", "gzip", "sentbert", "openai", "bge", "jinza"], (value) => (["sentbert", "openai", "bge", "jinza"].includes(value) ? "Needs extra packages or API keys in the worker env" : ""));
-                    return value ? { longContext: { rankMethod: value } } : undefined;
-                }
-                case "dynamicContextCompressionRatio": {
-                    const value = await promptNumber("dynamic_context_compression_ratio", s.longContext.dynamicContextCompressionRatio, "0–1; 0.3–0.4 recommended");
-                    return value === undefined ? undefined : { longContext: { dynamicContextCompressionRatio: value } };
-                }
-                case "conditionCompare":
-                    return { longContext: { conditionCompare: !s.longContext.conditionCompare } };
-                case "useSentenceLevelFilter":
-                case "useContextLevelFilter":
-                case "useTokenLevelFilter":
-                case "keepSplit":
-                    return { filters: { [key]: !s.filters[key] } };
-                case "iterativeSize": {
-                    const value = await promptNumber("iterative_size", s.filters.iterativeSize, "Tokens per iterative compression window");
-                    return value === undefined ? undefined : { filters: { iterativeSize: value } };
-                }
-                case "countModel": {
-                    const answer = await promptText("Counting model", s.counting.model, "Anthropic model ID passed to count_tokens");
-                    return answer?.trim() ? { counting: { model: answer.trim() } } : undefined;
-                }
-                case "vaultEntry": {
-                    const answer = await promptText("API key vault entry", s.counting.vaultEntry, "env-manager vault entry holding an Anthropic API key");
-                    return answer === undefined ? undefined : { counting: { vaultEntry: answer.trim() } };
-                }
-                case "fallbackInputPrice": {
-                    const value = await promptNumber("Fallback input price ($/M tokens)", s.counting.fallbackInputPrice, "Used when OpenCode has no price for the counting model");
-                    return value === undefined ? undefined : { counting: { fallbackInputPrice: value } };
-                }
-                case "autoEnabled":
-                    return { auto: { enabled: !s.auto.enabled } };
-                case "autoMinTokens": {
-                    const value = await promptNumber("Auto-compress threshold", s.auto.minTokens, "Only prompts estimated above this many tokens are compressed");
-                    return value === undefined ? undefined : { auto: { minTokens: value } };
-                }
-            }
-            return undefined;
-        }
-        async function settingsMenu() {
-            let selected;
-            for (;;) {
-                const s = await call("getSettings");
-                const local = s.engine !== "cloud";
-                const long = s.engine === "longllmlingua";
-                const classic = s.engine === "llmlingua" || long;
-                const localModelID = s.engine === "llmlingua2" ? s.models.llmlingua2 : s.models.llmlingua;
-                const options = [
-                    { title: `Engine: ${ENGINES[s.engine].title}`, value: "engine", description: ENGINES[s.engine].description, category: "Engine" },
-                    ...(local
-                        ? [
-                            { title: `Local model: ${localModelID.split("/").pop()}`, value: "model", description: localModelID, category: "Engine" },
-                            { title: `Device: ${s.device}`, value: "device", category: "Engine" },
-                        ]
-                        : []),
-                    {
-                        title: `Cloud model: ${s.cloudModel ? `${s.cloudModel.providerID}/${s.cloudModel.id}` : "not set"}`,
-                        value: "cloudModel",
-                        description: "Pick from the models available to this OpenCode session",
-                        category: "Engine",
-                    },
-                    { title: "Apply preset…", value: "preset", description: "Light / Balanced / Aggressive / Extreme", category: "Amount" },
-                    { title: `Mode: ${s.amount.mode}`, value: "mode", description: describeAmount(s), category: "Amount" },
-                    { title: `Rate: ${s.amount.rate}`, value: "rate", description: `≈${(1 / s.amount.rate).toFixed(1)}× compression`, category: "Amount" },
-                    { title: `Target tokens: ${s.amount.targetToken}`, value: "targetToken", category: "Amount" },
-                    { title: `Keep code blocks verbatim: ${onOff(s.protect.keepCode)}`, value: "keepCode", category: "Protection" },
-                    { title: `Protected tokens: ${encodeTokens(s.protect.forceTokens) || "none"}`, value: "forceTokens", category: "Protection" },
-                    ...(s.engine === "llmlingua2"
-                        ? [
-                            { title: `Keep digits: ${onOff(s.protect.forceReserveDigit)}`, value: "forceReserveDigit", category: "Protection" },
-                            { title: `Drop consecutive protected tokens: ${onOff(s.protect.dropConsecutive)}`, value: "dropConsecutive", category: "Protection" },
-                        ]
-                        : []),
-                    ...(local
-                        ? [{ title: `Minimum segment length: ${s.protect.minSegmentChars} chars`, value: "minSegmentChars", category: "Protection" }]
-                        : []),
-                    ...(classic || s.engine === "cloud"
-                        ? [{ title: `Question: ${s.longContext.question || "(none)"}`, value: "question", category: "Long context" }]
-                        : []),
-                    ...(classic
-                        ? [{ title: `Instruction: ${s.longContext.instruction || "(none)"}`, value: "instruction", category: "Long context" }]
-                        : []),
-                    ...(long
-                        ? [
-                            { title: `condition_in_question: ${s.longContext.conditionInQuestion}`, value: "conditionInQuestion", category: "Long context" },
-                            { title: `reorder_context: ${s.longContext.reorderContext}`, value: "reorderContext", category: "Long context" },
-                            { title: `rank_method: ${s.longContext.rankMethod}`, value: "rankMethod", category: "Long context" },
-                            {
-                                title: `dynamic_context_compression_ratio: ${s.longContext.dynamicContextCompressionRatio}`,
-                                value: "dynamicContextCompressionRatio",
-                                category: "Long context",
-                            },
-                            { title: `context_budget: ${s.longContext.contextBudget}`, value: "contextBudget", category: "Long context" },
-                            { title: `condition_compare: ${onOff(s.longContext.conditionCompare)}`, value: "conditionCompare", category: "Long context" },
-                        ]
-                        : []),
-                    ...(local
-                        ? [{ title: `Token-level filter: ${onOff(s.filters.useTokenLevelFilter)}`, value: "useTokenLevelFilter", category: "Filters" }]
-                        : []),
-                    ...(classic
-                        ? [
-                            { title: `Sentence-level filter: ${onOff(s.filters.useSentenceLevelFilter)}`, value: "useSentenceLevelFilter", category: "Filters" },
-                            ...(long
-                                ? [{ title: `Context-level filter: ${onOff(s.filters.useContextLevelFilter)}`, value: "useContextLevelFilter", category: "Filters" }]
-                                : []),
-                            { title: `iterative_size: ${s.filters.iterativeSize}`, value: "iterativeSize", category: "Filters" },
-                            { title: `keep_split: ${onOff(s.filters.keepSplit)}`, value: "keepSplit", category: "Filters" },
-                        ]
-                        : []),
-                    { title: `Counting model: ${s.counting.model}`, value: "countModel", category: "Token counting" },
-                    { title: `API key vault entry: ${s.counting.vaultEntry || "(none)"}`, value: "vaultEntry", category: "Token counting" },
-                    { title: `Fallback input price: $${s.counting.fallbackInputPrice}/M`, value: "fallbackInputPrice", category: "Token counting" },
-                    { title: `Auto-compress long prompts: ${onOff(s.auto.enabled)}`, value: "autoEnabled", category: "Automatic" },
-                    { title: `Auto-compress threshold: ${s.auto.minTokens} tokens`, value: "autoMinTokens", category: "Automatic" },
-                    { title: "Status…", value: "__status", category: "Actions" },
-                    { title: "Load model now (warm up)", value: "__warmup", category: "Actions" },
-                    { title: "Stop worker (free GPU memory)", value: "__stop", category: "Actions" },
-                    { title: "Reset all settings to defaults", value: "__reset", category: "Actions" },
-                ];
-                const choice = await context.ui.dialog.select({
-                    title: `Compressor — ${describeEngine(s)} · ${describeAmount(s)}`,
-                    placeholder: "Search settings",
-                    current: selected,
-                    options,
-                    search: (query, available) => {
-                        const needle = query.trim().toLowerCase();
-                        if (!needle)
-                            return available;
-                        return available.filter((option) => option.title.toLowerCase().includes(needle) ||
-                            (option.description ?? "").toLowerCase().includes(needle) ||
-                            (option.category ?? "").toLowerCase().includes(needle));
-                    },
-                });
-                if (!choice)
-                    return;
-                selected = choice;
-                try {
-                    if (choice === "__status") {
-                        const status = await call("status");
-                        const lines = [
-                            `Engine: ${status.engine}`,
-                            `Amount: ${status.amount}`,
-                            `Worker: ${status.worker.running ? `running (pid ${status.worker.pid})` : "stopped"}`,
-                            ...(status.worker.lastStatus ? [`Last: ${status.worker.lastStatus}`] : []),
-                            `Anthropic API key: ${status.apiKey.source ?? "not found — counts are estimates"}`,
-                            `Auto-compress: ${status.autoCompress.enabled ? `on, ≥ ${status.autoCompress.minTokens} tokens` : "off"}`,
-                            ...(status.worker.stderr?.length ? ["", "Worker log:", ...status.worker.stderr] : []),
-                        ];
-                        await context.ui.dialog.alert({ title: "Compressor status", message: lines.join("\n") });
-                        continue;
-                    }
-                    if (choice === "__warmup") {
-                        toast("Loading model…");
-                        const result = await call("warmup");
-                        toast(result.message ?? `Loaded ${(result.loaded ?? []).join(" on ")}`, "success");
-                        continue;
-                    }
-                    if (choice === "__stop") {
-                        await call("stopWorker");
-                        toast("Worker stopped", "success");
-                        continue;
-                    }
-                    if (choice === "__reset") {
-                        const confirmed = await context.ui.dialog.confirm({
-                            title: "Reset settings",
-                            message: "Reset every compressor setting to its default?",
-                            label: { confirm: "Reset", cancel: "Cancel" },
-                        });
-                        if (confirmed) {
-                            await call("resetSettings");
-                            toast("Settings reset", "success");
-                        }
-                        continue;
-                    }
-                    const patch = await editSetting(choice, s);
-                    if (patch)
-                        await call("setSettings", { patch });
-                }
-                catch (error) {
-                    toast(errorMessage(error), "error");
-                }
-            }
-        }
-        const guard = (fn) => async (input) => {
+                return;
+            selected = choice;
             try {
-                await fn(input);
+                if (choice === "__status") {
+                    const status = await call("status");
+                    const lines = [
+                        `Engine: ${status.engine}`,
+                        `Amount: ${status.amount}`,
+                        `Worker: ${status.worker.running ? `running (pid ${status.worker.pid})` : "stopped"}`,
+                        ...(status.worker.lastStatus ? [`Last: ${status.worker.lastStatus}`] : []),
+                        `Anthropic API key: ${status.apiKey.source ?? "not found — counts are estimates"}`,
+                        `Auto-compress: ${status.autoCompress.enabled ? `on, ≥ ${status.autoCompress.minTokens} tokens` : "off"}`,
+                        ...(status.worker.stderr?.length ? ["", "Worker log:", ...status.worker.stderr] : []),
+                    ];
+                    await context.ui.dialog.alert({ title: "Compressor status", message: lines.join("\n") });
+                    continue;
+                }
+                if (choice === "__warmup") {
+                    toast("Loading model…");
+                    const result = await call("warmup");
+                    toast(result.message ?? `Loaded ${(result.loaded ?? []).join(" on ")}`, "success");
+                    continue;
+                }
+                if (choice === "__stop") {
+                    await call("stopWorker");
+                    toast("Worker stopped", "success");
+                    continue;
+                }
+                if (choice === "__reset") {
+                    const confirmed = await context.ui.dialog.confirm({
+                        title: "Reset settings",
+                        message: "Reset every compressor setting to its default?",
+                        label: { confirm: "Reset", cancel: "Cancel" },
+                    });
+                    if (confirmed) {
+                        await call("resetSettings");
+                        toast("Settings reset", "success");
+                    }
+                    continue;
+                }
+                const patch = await editSetting(choice, s);
+                if (patch)
+                    await call("setSettings", { patch });
             }
             catch (error) {
                 toast(errorMessage(error), "error");
             }
-        };
-        context.keymap.layer(() => ({
-            mode: "global",
-            priority: 10,
-            commands: [
-                {
-                    id: "compressor.tokens",
-                    title: "Count prompt tokens",
-                    description: "Count tokens with Anthropic's count_tokens API (text, clipboard or file)",
-                    group: "Compressor",
-                    palette: true,
-                    slash: { name: "tokens", aliases: ["count-tokens"], arguments: true },
-                    run: guard(tokens),
-                },
-                {
-                    id: "compressor.compress",
-                    title: "Compress prompt",
-                    description: "Compress text, clipboard or a file with LLMLingua or a cloud model",
-                    group: "Compressor",
-                    palette: true,
-                    slash: { name: "compress", arguments: true },
-                    run: guard(compress),
-                },
-                {
-                    id: "compressor.settings",
-                    title: "Compressor settings",
-                    description: "Engine, model, rate, protection and long-context options",
-                    group: "Compressor",
-                    palette: true,
-                    slash: { name: "compress-settings", aliases: ["compressor"] },
-                    run: guard(settingsMenu),
-                },
-            ],
-        }));
-        return () => {
-            if (typeof unsubscribe === "function")
-                unsubscribe();
-        };
-    },
-});
+        }
+    }
+    const guard = (fn) => async (input) => {
+        try {
+            await fn(input);
+        }
+        catch (error) {
+            toast(errorMessage(error), "error");
+        }
+    };
+    context.keymap.layer(() => ({
+        mode: "global",
+        priority: 10,
+        commands: [
+            {
+                id: "compressor.tokens",
+                title: "Count prompt tokens",
+                description: "Count tokens with Anthropic's count_tokens API (text, clipboard or file)",
+                group: "Compressor",
+                palette: true,
+                slash: { name: "tokens", aliases: ["count-tokens"], arguments: true },
+                run: guard(tokens),
+            },
+            {
+                id: "compressor.compress",
+                title: "Compress prompt",
+                description: "Compress text, clipboard or a file with LLMLingua or a cloud model",
+                group: "Compressor",
+                palette: true,
+                slash: { name: "compress", arguments: true },
+                run: guard(compress),
+            },
+            {
+                id: "compressor.settings",
+                title: "Compressor settings",
+                description: "Engine, model, rate, protection and long-context options",
+                group: "Compressor",
+                palette: true,
+                slash: { name: "compress-settings", aliases: ["compressor"] },
+                run: guard(settingsMenu),
+            },
+        ],
+    }));
+    return () => {
+        if (typeof unsubscribe === "function")
+            unsubscribe();
+    };
+}
 function errorMessage(error) {
     if (error && typeof error === "object" && "message" in error)
         return String(error.message);

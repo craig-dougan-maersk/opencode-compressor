@@ -59,6 +59,8 @@ If `uv` is not on `PATH`, pass `"uv": "/path/to/uv"`. Other options:
 | `pythonDir` | bundled `python/` | Directory holding `pyproject.toml` and `worker.py` |
 | `env` | `{}` | Extra environment for the worker, e.g. `HF_TOKEN`, `HF_HOME`, `CUDA_VISIBLE_DEVICES` |
 | `idleMinutes` | `30` | Stop the worker after this many idle minutes (0 keeps it running) |
+| `timeoutMinutes` | `10` | Abort one compression after this long and stop the worker (0 disables) |
+| `minAvailableMB` | `800` | Refuse to load a model when less RAM than this is free |
 | `apiKey` | — | Anthropic API key, if you would rather not use the other sources |
 | `countTokensURL` | `https://api.anthropic.com/v1/messages/count_tokens` | Override for a proxy |
 
@@ -175,6 +177,39 @@ If the prompt contains `<llmlingua …>` tags, it is passed to LLMLingua's
 structured compression, so individual sections can set their own rate or opt out
 (`<llmlingua, compress=False>`).
 
+## Crashes, memory and "service is restarting"
+
+A local model is the only part of this plugin that can use several gigabytes.
+Without a guard the kernel's OOM killer may pick the OpenCode process, after
+which the desktop app loops restarting its service and the CLI fails with
+`ECONNRESET` from `plugin list`. The plugin is built so that it cannot take
+OpenCode down with it:
+
+- The Python worker raises its own `oom_score_adj` to `800`, so the kernel kills
+  the worker before OpenCode when RAM runs out.
+- Before loading a model the worker checks `/proc/meminfo` and refuses with a
+  clear message when less than `minAvailableMB` is free; below 4 GB it warns.
+- Local compression is capped at 1 MB of input (about 100k tokens). Larger
+  inputs are refused with a message suggesting the cloud engine or splitting.
+- The worker runs in its own process group. Stopping it, aborting a request or
+  a timeout kills `uv` and Python together, so no orphan keeps the model in RAM.
+- Every worker pipe has an error handler. A dead worker (`EPIPE`, crash, model
+  failure) rejects that request instead of becoming an uncaught exception.
+- A response line larger than 64 MB stops the worker rather than being buffered.
+- Requests time out after `timeoutMinutes`; auto-compress failures only show a
+  status message and never block the prompt.
+- Plugin setup is guarded: if an OpenCode API changes, the affected feature is
+  logged and disabled, but the plugin cannot prevent OpenCode from starting.
+
+If OpenCode is already stuck in "service is restarting", quit the desktop app
+and check for a leftover worker from the crashed session:
+
+```sh
+pgrep -af 'uv run.*opencode-compressor|worker.py'
+```
+
+Stopping it frees the model's memory; the next normal start will not restart it.
+
 ## Which engine should I use?
 
 | Situation | Use |
@@ -208,7 +243,7 @@ digits survived; the saving came entirely from the prose.
 ```sh
 npm run compile     # tsc to dist/
 npm run typecheck
-npm test            # unit + fake-context plugin tests
+npm test                 # unit, fake-context plugin and worker-crash tests
 SKIP_WORKER=1 npm test   # skip the real model load
 cd python && uv run python worker.py   # talk to the worker directly over stdin
 ```

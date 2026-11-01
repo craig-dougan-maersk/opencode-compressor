@@ -19,6 +19,18 @@ const SETTINGS_KEY = "settings"
 export default Plugin.define({
   id: "compressor",
   async setup(ctx) {
+    try {
+      return await install(ctx)
+    } catch (error) {
+      // A plugin that rejects during setup can prevent OpenCode from starting.
+      // Lose the compressor, not the editor.
+      reportError("setup", error)
+      return () => {}
+    }
+  },
+})
+
+async function install(ctx: Plugin.Context) {
     const directory = path.resolve(ctx.location.directory)
     const options: Record<string, any> = (ctx.options as any) ?? {}
     let registration: any
@@ -27,14 +39,26 @@ export default Plugin.define({
     const ownSends = new Set<string>()
 
     const emit = (name: string, data: Record<string, unknown>) => {
-      void registration?.events.emit(name, data).catch(() => undefined)
+      try {
+        void Promise.resolve(registration?.events.emit(name, data)).catch(() => undefined)
+      } catch {
+        // Events are best-effort.
+      }
     }
+
+    const minAvailableMB =
+      typeof options.minAvailableMB === "number" && options.minAvailableMB > 0 ? options.minAvailableMB : 800
 
     const worker = new Worker({
       uv: typeof options.uv === "string" ? options.uv : undefined,
       pythonDir: typeof options.pythonDir === "string" ? expandPath(options.pythonDir, directory) : undefined,
-      env: options.env && typeof options.env === "object" ? options.env : undefined,
+      env: {
+        LLMLINGUA_MIN_AVAILABLE_MB: String(minAvailableMB),
+        ...(options.env && typeof options.env === "object" ? options.env : {}),
+      },
       idleMs: typeof options.idleMinutes === "number" ? options.idleMinutes * 60_000 : 30 * 60_000,
+      callTimeoutMs:
+        typeof options.timeoutMinutes === "number" ? Math.max(0, options.timeoutMinutes) * 60_000 : undefined,
       onStatus: (message) => emit("status", { message }),
     })
 
@@ -159,7 +183,12 @@ export default Plugin.define({
       },
     }
 
-    registration = await ctx.rpc.register(Compressor, handlers as any)
+    try {
+      registration = await ctx.rpc.register(Compressor, handlers as any)
+    } catch (error) {
+      // The agent tools still work without the TUI bridge.
+      reportError("RPC registration", error)
+    }
 
     const source = (context: any) => ({ type: "tool", messageID: context.messageID, id: context.id })
 
@@ -174,107 +203,125 @@ export default Plugin.define({
       } as any)
     }
 
-    const toolRegistration = await ctx.tool.transform((editor) => {
-      editor.namespace({
-        name: "compressor",
-        description:
-          "Count prompt tokens with Anthropic's count_tokens API and compress prompts with LLMLingua or a cloud model.",
+    let toolRegistration: any
+    try {
+      toolRegistration = await ctx.tool.transform((editor) => {
+        editor.namespace({
+          name: "compressor",
+          description:
+            "Count prompt tokens with Anthropic's count_tokens API and compress prompts with LLMLingua or a cloud model.",
+        })
+        editor.add({
+          name: "count",
+          description:
+            "Count the tokens a text or file costs as Claude input, using Anthropic's free count_tokens endpoint. Falls back to an estimate when no API key is available.",
+          input: {
+            type: "object",
+            properties: {
+              text: { type: "string", description: "Text to count" },
+              path: { type: "string", description: "File to count instead of text" },
+              model: { type: "string", description: "Anthropic model ID; defaults to the configured counting model" },
+            },
+            additionalProperties: false,
+          },
+          options: { namespace: "compressor", codemode: true },
+          execute: async (input: any, context: any) => {
+            if (input?.path) await assertAccess(context, "read", expandPath(input.path, directory))
+            const result = await service.count(input ?? {}, context.signal)
+            return { content: formatCount(result) }
+          },
+        } as any)
+        editor.add({
+          name: "compress",
+          description:
+            "Compress a prompt (text or file) with Microsoft LLMLingua (local) or a cloud model, report original/compressed token counts and savings, and return the compressed text. Fenced code blocks are kept verbatim by default.",
+          input: {
+            type: "object",
+            properties: {
+              text: { type: "string", description: "Prompt text to compress" },
+              path: { type: "string", description: "File to compress instead of text" },
+              writeTo: { type: "string", description: "Optional file to write the compressed text to" },
+              engine: { type: "string", enum: ["llmlingua2", "llmlingua", "longllmlingua", "cloud"] },
+              rate: { type: "number", description: "Fraction of tokens to keep, 0.05-1 (0.5 = 2x)" },
+              targetToken: { type: "number", description: "Absolute token target instead of rate" },
+              question: { type: "string", description: "LongLLMLingua: question to keep relevant content for" },
+              keepCode: { type: "boolean", description: "Keep fenced code blocks verbatim" },
+            },
+            additionalProperties: false,
+          },
+          options: { namespace: "compressor", codemode: true },
+          execute: async (input: any, context: any) => {
+            if (input?.path) await assertAccess(context, "read", expandPath(input.path, directory))
+            if (input?.writeTo) await assertAccess(context, "edit", expandPath(input.writeTo, directory))
+            await context.progress?.({ status: "compressing" })
+            const overrides: Overrides = {}
+            for (const key of ["engine", "rate", "targetToken", "question", "keepCode"] as const) {
+              if (input?.[key] !== undefined) (overrides as any)[key] = input[key]
+            }
+            const result = await service.compress(
+              { text: input?.text, path: input?.path, writeTo: input?.writeTo, overrides },
+              context.signal,
+            )
+            return { content: `${formatSummary(result)}\n\n<compressed>\n${result.compressed}\n</compressed>` }
+          },
+        } as any)
       })
-      editor.add({
-        name: "count",
-        description:
-          "Count the tokens a text or file costs as Claude input, using Anthropic's free count_tokens endpoint. Falls back to an estimate when no API key is available.",
-        input: {
-          type: "object",
-          properties: {
-            text: { type: "string", description: "Text to count" },
-            path: { type: "string", description: "File to count instead of text" },
-            model: { type: "string", description: "Anthropic model ID; defaults to the configured counting model" },
-          },
-          additionalProperties: false,
-        },
-        options: { namespace: "compressor", codemode: true },
-        execute: async (input: any, context: any) => {
-          if (input?.path) await assertAccess(context, "read", expandPath(input.path, directory))
-          const result = await service.count(input ?? {}, context.signal)
-          return { content: formatCount(result) }
-        },
-      } as any)
-      editor.add({
-        name: "compress",
-        description:
-          "Compress a prompt (text or file) with Microsoft LLMLingua (local) or a cloud model, report original/compressed token counts and savings, and return the compressed text. Fenced code blocks are kept verbatim by default.",
-        input: {
-          type: "object",
-          properties: {
-            text: { type: "string", description: "Prompt text to compress" },
-            path: { type: "string", description: "File to compress instead of text" },
-            writeTo: { type: "string", description: "Optional file to write the compressed text to" },
-            engine: { type: "string", enum: ["llmlingua2", "llmlingua", "longllmlingua", "cloud"] },
-            rate: { type: "number", description: "Fraction of tokens to keep, 0.05-1 (0.5 = 2x)" },
-            targetToken: { type: "number", description: "Absolute token target instead of rate" },
-            question: { type: "string", description: "LongLLMLingua: question to keep relevant content for" },
-            keepCode: { type: "boolean", description: "Keep fenced code blocks verbatim" },
-          },
-          additionalProperties: false,
-        },
-        options: { namespace: "compressor", codemode: true },
-        execute: async (input: any, context: any) => {
-          if (input?.path) await assertAccess(context, "read", expandPath(input.path, directory))
-          if (input?.writeTo) await assertAccess(context, "edit", expandPath(input.writeTo, directory))
-          await context.progress?.({ status: "compressing" })
-          const overrides: Overrides = {}
-          for (const key of ["engine", "rate", "targetToken", "question", "keepCode"] as const) {
-            if (input?.[key] !== undefined) (overrides as any)[key] = input[key]
-          }
-          const result = await service.compress(
-            { text: input?.text, path: input?.path, writeTo: input?.writeTo, overrides },
-            context.signal,
-          )
-          return { content: `${formatSummary(result)}\n\n<compressed>\n${result.compressed}\n</compressed>` }
-        },
-      } as any)
-    })
+    } catch (error) {
+      reportError("tool registration", error)
+    }
 
     // Optional automatic compression of long user prompts.
-    const promptHook = await ctx.session.hook("prompt", async (event: any) => {
-      const text: string = event?.prompt?.text ?? ""
-      if (!text || ownSends.has(text)) return
-      const settings = await loadSettings()
-      if (!settings.auto.enabled) return
-      if (estimateTokens(text) < settings.auto.minTokens) return
-      // Rewriting text would invalidate mention offsets; leave such prompts alone.
-      const mentions = [...(event.prompt.files ?? []), ...(event.prompt.agents ?? [])].some((item: any) => item?.mention)
-      if (mentions) return
-      try {
-        const result = await service.compress({ text })
-        if (result.compressedTokens > 0 && result.compressedTokens < result.originalTokens) {
-          event.prompt.text = result.compressed
-          event.metadata = {
-            ...event.metadata,
-            compressor: {
-              originalTokens: result.originalTokens,
-              compressedTokens: result.compressedTokens,
-              engine: result.engine,
-            },
+    let promptHook: any
+    try {
+      promptHook = await ctx.session.hook("prompt", async (event: any) => {
+        const text: string = event?.prompt?.text ?? ""
+        if (!text || ownSends.has(text)) return
+        const settings = await loadSettings()
+        if (!settings.auto.enabled) return
+        if (estimateTokens(text) < settings.auto.minTokens) return
+        // Rewriting text would invalidate mention offsets; leave such prompts alone.
+        const mentions = [...(event.prompt.files ?? []), ...(event.prompt.agents ?? [])].some((item: any) => item?.mention)
+        if (mentions) return
+        try {
+          const result = await service.compress({ text })
+          if (result.compressedTokens > 0 && result.compressedTokens < result.originalTokens) {
+            event.prompt.text = result.compressed
+            event.metadata = {
+              ...event.metadata,
+              compressor: {
+                originalTokens: result.originalTokens,
+                compressedTokens: result.compressedTokens,
+                engine: result.engine,
+              },
+            }
+            emit("status", {
+              message: `Auto-compressed prompt ${result.originalTokens} → ${result.compressedTokens} tokens (${result.ratio.toFixed(1)}×)`,
+            })
           }
-          emit("status", {
-            message: `Auto-compressed prompt ${result.originalTokens} → ${result.compressedTokens} tokens (${result.ratio.toFixed(1)}×)`,
-          })
+        } catch (error) {
+          emit("status", { message: `Auto-compress skipped: ${error instanceof Error ? error.message : String(error)}` })
         }
-      } catch (error) {
-        emit("status", { message: `Auto-compress skipped: ${error instanceof Error ? error.message : String(error)}` })
-      }
-    })
+      })
+    } catch (error) {
+      reportError("prompt hook", error)
+    }
 
     return () => {
       worker.stop()
-      void promptHook.dispose()
-      void toolRegistration.dispose()
+      void promptHook?.dispose()
+      void toolRegistration?.dispose()
       void registration?.dispose()
     }
-  },
-})
+}
+
+function reportError(scope: string, error: unknown): void {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  try {
+    console.error(`[compressor] ${scope} failed: ${detail}`)
+  } catch {
+    // Nothing useful to do if stderr is unavailable.
+  }
+}
 
 /** RPC outputs must be JSON; drop undefined object fields recursively. */
 function jsonSafe<T>(value: T): T {

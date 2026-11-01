@@ -140,6 +140,16 @@ export function writeClipboard(text: string): boolean {
 export default Plugin.define({
   id: "compressor.tui",
   async setup(context) {
+    try {
+      return await install(context)
+    } catch (error) {
+      console.error(`[compressor] TUI setup failed: ${error instanceof Error ? error.message : String(error)}`)
+      return () => {}
+    }
+  },
+})
+
+async function install(context: Plugin.Context) {
     const client = context.client.rpc(Compressor) as any
     let last: CompressResult | undefined
 
@@ -722,8 +732,7 @@ export default Plugin.define({
     return () => {
       if (typeof unsubscribe === "function") unsubscribe()
     }
-  },
-})
+}
 
 function errorMessage(error: unknown): string {
   if (error && typeof error === "object" && "message" in error) return String((error as any).message)

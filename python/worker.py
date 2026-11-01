@@ -26,6 +26,13 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 _out = sys.stdout
 sys.stdout = sys.stderr  # keep library prints off the protocol channel
 
+# Loading a model in the worker must never get OpenCode itself killed. The OOM
+# killer picks the process with the highest score; this child is expendable.
+try:
+    MIN_AVAILABLE_MB = int(os.environ.get("LLMLINGUA_MIN_AVAILABLE_MB", "800"))
+except ValueError:
+    MIN_AVAILABLE_MB = 800
+
 _compressor: Any = None
 _compressor_key: tuple | None = None
 
@@ -41,6 +48,28 @@ def send(payload: dict) -> None:
 
 def status(message: str) -> None:
     send({"event": "status", "message": message})
+
+
+def prefer_being_killed() -> None:
+    """Tell the kernel to kill this worker before OpenCode when RAM runs out."""
+    try:
+        with open("/proc/self/oom_score_adj", "w", encoding="ascii") as handle:
+            handle.write("800")
+    except OSError:
+        # Not Linux, /proc unavailable, or not permitted; nothing to do.
+        pass
+
+
+def available_memory_mb() -> int | None:
+    """MemAvailable from /proc/meminfo, in MB, when it can be read."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def resolve_device(device: str) -> str:
@@ -79,6 +108,18 @@ def load(params: dict) -> Any:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+    available = available_memory_mb()
+    if available is not None and available < MIN_AVAILABLE_MB:
+        raise RuntimeError(
+            f"Only {available} MB of RAM is available; the local compressor needs more than {MIN_AVAILABLE_MB} MB. "
+            "Close some applications, choose a smaller model in /compress-settings, or use the cloud engine."
+        )
+    if available is not None and available < 4096:
+        status(
+            f"Low memory: {available} MB available. If the machine runs out, this worker is "
+            "killed before OpenCode, and the compression fails."
+        )
 
     from llmlingua import PromptCompressor
 
@@ -210,6 +251,7 @@ METHODS = {
 
 
 def main() -> None:
+    prefer_being_killed()
     send({"event": "ready", "pid": os.getpid()})
     for line in sys.stdin:
         line = line.strip()

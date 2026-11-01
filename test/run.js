@@ -143,6 +143,114 @@ assert.equal(event.prompt.text, "x ".repeat(10000))
 await handlers.resetSettings()
 assert.equal((await handlers.getSettings()).engine, "llmlingua2")
 
+// Large local inputs are refused before a model can exhaust memory.
+await assert.rejects(
+  handlers.compress({ text: "word ".repeat(220_000) }),
+  /limited to 1024 KB/,
+)
+
+// A broken optional API must not reject setup: OpenCode must keep booting.
+{
+  const quiet = console.error
+  console.error = () => undefined
+  try {
+    const brokenTools = {
+      ...fakeContext,
+      tool: { transform: async () => { throw new Error("no tools API") } },
+      session: { ...fakeContext.session, hook: async () => { throw new Error("no hook API") } },
+      rpc: Object.assign(() => ({ vaultGet: async () => ({ values: {} }) }), {
+        register: async () => { throw new Error("rpc unavailable") },
+      }),
+    }
+    const brokenCleanup = await plugin.setup(brokenTools)
+    assert.equal(typeof brokenCleanup, "function", "setup degrades instead of throwing")
+    await brokenCleanup()
+  } finally {
+    console.error = quiet
+  }
+}
+
+// ---------- worker robustness ----------
+{
+  const { Worker } = await import("../dist/worker.js")
+  const fakeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "compressor-worker-"))
+  const fakeDir = path.join(fakeRoot, "python")
+  await fs.mkdir(fakeDir)
+  await fs.writeFile(
+    path.join(fakeDir, "worker.py"),
+    [
+      "import json, os, sys, time",
+      "out = sys.stdout",
+      "def send(payload):",
+      "    out.write(json.dumps(payload) + '\\n'); out.flush()",
+      "send({'event': 'ready', 'pid': os.getpid()})",
+      "for line in sys.stdin:",
+      "    try:",
+      "        request = json.loads(line)",
+      "    except Exception:",
+      "        continue",
+      "    method, rid = request.get('method'), request.get('id')",
+      "    if method == 'echo':",
+      "        send({'id': rid, 'ok': True, 'result': {'value': request['params']['value']}})",
+      "    elif method == 'die':",
+      "        os._exit(3)",
+      "    elif method == 'big':",
+      "        out.write('x' * (2 * 1024 * 1024) + '\\n'); out.flush()",
+      "    elif method == 'slow':",
+      "        time.sleep(10); send({'id': rid, 'ok': True, 'result': {}})",
+    ].join("\n"),
+  )
+  const fakeUv = path.join(fakeRoot, "uv")
+  await fs.writeFile(fakeUv, '#!/bin/sh\nfor last; do :; done\nexec python3 "$last"\n', { mode: 0o755 })
+  const makeWorker = (options = {}) => new Worker({ uv: fakeUv, pythonDir: fakeDir, ...options })
+
+  const worker = makeWorker({ maxLineBytes: 64 * 1024, callTimeoutMs: 500 })
+  assert.deepEqual(await worker.call("echo", { value: "hello" }), { value: "hello" })
+  assert.equal(worker.running, true)
+
+  // A dead child rejects the call; it must not become an uncaught exception.
+  await assert.rejects(worker.call("die"), /exited/)
+  assert.deepEqual(await worker.call("echo", { value: "after crash" }), { value: "after crash" }, "worker restarts")
+
+  // An oversized protocol line stops the worker instead of buffering it.
+  await assert.rejects(worker.call("big"), /response larger than/)
+  assert.deepEqual(await worker.call("echo", { value: "after oversized" }), { value: "after oversized" })
+
+  // stop() rejects a call that is waiting for the worker to start, and the
+  // worker can be started again afterwards.
+  worker.stop()
+  assert.deepEqual(await worker.call("echo", { value: "restarted" }), { value: "restarted" })
+
+  // Concurrent calls racing a dying child must only reject, never crash.
+  const storm = makeWorker()
+  const settled = await Promise.allSettled([
+    storm.call("die"),
+    ...Array.from({ length: 20 }, (_, index) => storm.call("echo", { value: index })),
+  ])
+  assert.ok(settled.some((entry) => entry.status === "rejected"), "requests racing a dead worker reject")
+  storm.stop()
+
+  // Timeouts stop the worker rather than hanging the caller forever.
+  const slow = makeWorker({ callTimeoutMs: 150 })
+  await assert.rejects(slow.call("slow"), /did not finish within/)
+  assert.equal(slow.running, false)
+
+  // Aborting kills the worker and rejects with "aborted".
+  const aborting = makeWorker({ callTimeoutMs: 0 })
+  const controller = new AbortController()
+  const aborted = aborting.call("slow", {}, controller.signal)
+  setTimeout(() => controller.abort(), 50)
+  await assert.rejects(aborted, /aborted/)
+  assert.equal(aborting.running, false)
+
+  // A missing uv is a clean error, not a process crash.
+  const missing = new Worker({ uv: path.join(fakeRoot, "missing-uv"), pythonDir: fakeDir })
+  await assert.rejects(missing.call("echo", { value: 1 }), /Could not start the LLMLingua worker/)
+
+  worker.stop()
+  await fs.rm(fakeRoot, { recursive: true, force: true })
+}
+
 // ---------- real LLMLingua worker (skip with SKIP_WORKER=1) ----------
 if (process.env.SKIP_WORKER !== "1") {
   const text =

@@ -18,6 +18,13 @@ import type { Worker } from "./worker.js"
 
 export const MAX_INPUT_BYTES = 4 * 1024 * 1024
 
+/**
+ * LLMLingua keeps tokenizer output and model activations for the whole prompt
+ * in memory. A multi-megabyte prompt can push the machine into the OOM killer,
+ * which may pick the OpenCode process; refuse it with an actionable message.
+ */
+export const MAX_LOCAL_BYTES = 1024 * 1024
+
 export interface Source {
   text?: string
   path?: string
@@ -124,6 +131,13 @@ export function createService(deps: ServiceDeps) {
   }
 
   async function compressLocal(text: string, settings: Settings, signal?: AbortSignal) {
+    const bytes = Buffer.byteLength(text)
+    if (bytes > MAX_LOCAL_BYTES) {
+      throw new Error(
+        `Text is ${(bytes / 1024).toFixed(0)} KB; local compression is limited to ${MAX_LOCAL_BYTES / 1024} KB ` +
+          "to keep OpenCode's memory use safe. Split the input, or use the cloud engine.",
+      )
+    }
     const result = await deps.worker.call(
       "compress",
       {

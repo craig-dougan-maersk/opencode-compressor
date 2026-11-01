@@ -5,6 +5,12 @@ import { estimateTokens } from "./anthropic.js";
 import { cleanCloudOutput, cloudPrompt, protectCode, restoreCode } from "./cloud.js";
 import { applyOverrides, describeAmount, describeEngine, llmlinguaKwargs, localModel, normalizeSettings, } from "./settings.js";
 export const MAX_INPUT_BYTES = 4 * 1024 * 1024;
+/**
+ * LLMLingua keeps tokenizer output and model activations for the whole prompt
+ * in memory. A multi-megabyte prompt can push the machine into the OOM killer,
+ * which may pick the OpenCode process; refuse it with an actionable message.
+ */
+export const MAX_LOCAL_BYTES = 1024 * 1024;
 export function expandPath(input, directory) {
     let value = input.trim();
     if (value === "~")
@@ -53,6 +59,11 @@ export function createService(deps) {
         };
     }
     async function compressLocal(text, settings, signal) {
+        const bytes = Buffer.byteLength(text);
+        if (bytes > MAX_LOCAL_BYTES) {
+            throw new Error(`Text is ${(bytes / 1024).toFixed(0)} KB; local compression is limited to ${MAX_LOCAL_BYTES / 1024} KB ` +
+                "to keep OpenCode's memory use safe. Split the input, or use the cloud engine.");
+        }
         const result = await deps.worker.call("compress", {
             text,
             model: localModel(settings),

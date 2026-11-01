@@ -1,0 +1,14 @@
+[project]
+name = "opencode-compressor-worker"
+version = "0.1.0"
+description = "LLMLingua worker process for the opencode-compressor plugin"
+requires-python = ">=3.10"
+dependencies = [
+  "llmlingua>=0.2.2",
+  "torch>=2.2",
+  "transformers>=4.40",
+  "accelerate>=0.30",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,51 @@
+{
+  "name": "opencode-compressor",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: count prompt tokens with Anthropic's count_tokens API and compress prompts with Microsoft LLMLingua or a cloud model",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/craig-dougan-maersk/opencode-compressor.git"
+  },
+  "homepage": "https://github.com/craig-dougan-maersk/opencode-compressor#readme",
+  "bugs": {
+    "url": "https://github.com/craig-dougan-maersk/opencode-compressor/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "llmlingua",
+    "prompt-compression",
+    "tokens",
+    "anthropic"
+  ],
+  "exports": {
+    ".": "./dist/index.js",
+    "./tui": "./dist/tui.js",
+    "./rpc": "./dist/rpc.js"
+  },
+  "files": [
+    "dist",
+    "python/pyproject.toml",
+    "python/uv.lock",
+    "python/worker.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "compile": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run compile && node test/run.js"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.5"
+  },
+  "devDependencies": {
+    "@opentui/core": "^0.8.1",
+    "@opentui/solid": "^0.8.1",
+    "@types/node": "^22.0.0",
+    "solid-js": "^1.9.18",
+    "typescript": "^5.6.0"
+  }
+}

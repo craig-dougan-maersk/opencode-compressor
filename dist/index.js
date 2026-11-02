@@ -38,11 +38,13 @@ async function install(ctx) {
         }
     };
     const minAvailableMB = typeof options.minAvailableMB === "number" && options.minAvailableMB > 0 ? options.minAvailableMB : 800;
+    const memoryLimitMB = typeof options.memoryLimitMB === "number" && options.memoryLimitMB > 0 ? Math.round(options.memoryLimitMB) : 0;
     const worker = new Worker({
         uv: typeof options.uv === "string" ? options.uv : undefined,
         pythonDir: typeof options.pythonDir === "string" ? expandPath(options.pythonDir, directory) : undefined,
         env: {
             LLMLINGUA_MIN_AVAILABLE_MB: String(minAvailableMB),
+            ...(memoryLimitMB > 0 ? { LLMLINGUA_MAX_RSS_MB: String(memoryLimitMB) } : {}),
             ...(options.env && typeof options.env === "object" ? options.env : {}),
         },
         idleMs: typeof options.idleMinutes === "number" ? options.idleMinutes * 60_000 : 30 * 60_000,

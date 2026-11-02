@@ -253,6 +253,24 @@ await assert.rejects(
 
 // ---------- real LLMLingua worker (skip with SKIP_WORKER=1) ----------
 if (process.env.SKIP_WORKER !== "1") {
+  // A memory budget stops the worker before the machine runs out of RAM.
+  if (process.platform === "linux") {
+    const { Worker } = await import("../dist/worker.js")
+    const limited = new Worker({
+      pythonDir: path.resolve("python"),
+      env: { LLMLINGUA_MAX_RSS_MB: "80" },
+      callTimeoutMs: 30_000,
+    })
+    const started = Date.now()
+    await assert.rejects(
+      limited.call("load", { model: "openai-community/gpt2", llmlingua2: false, device: "cpu" }),
+      /exited \(137\)|budget/i,
+    )
+    assert.equal(limited.running, false)
+    assert.ok(Date.now() - started < 20_000, "the budget stops the load early")
+    limited.stop()
+  }
+
   const text =
     "Hello there. I would really like you to please go ahead and carefully review the following function and then tell me " +
     "whether or not there are any bugs in it, and if there are, please explain them to me in detail so that I can fix them.\n\n" +

@@ -61,6 +61,7 @@ If `uv` is not on `PATH`, pass `"uv": "/path/to/uv"`. Other options:
 | `idleMinutes` | `30` | Stop the worker after this many idle minutes (0 keeps it running) |
 | `timeoutMinutes` | `10` | Abort one compression after this long and stop the worker (0 disables) |
 | `minAvailableMB` | `800` | Refuse to load a model when less RAM than this is free |
+| `memoryLimitMB` | `0` (off) | Stop the worker when its own RSS passes this budget, e.g. `2048` |
 | `apiKey` | — | Anthropic API key, if you would rather not use the other sources |
 | `countTokensURL` | `https://api.anthropic.com/v1/messages/count_tokens` | Override for a proxy |
 
@@ -177,6 +178,37 @@ If the prompt contains `<llmlingua …>` tags, it is passed to LLMLingua's
 structured compression, so individual sections can set their own rate or opt out
 (`<llmlingua, compress=False>`).
 
+## Memory use
+
+Measured on a machine with an RTX 4050 (6 GB VRAM), compressing a ~3 KB prompt:
+
+| Engine / model | Worker RSS | VRAM |
+| --- | --- | --- |
+| LLMLingua-2 bert-base (default) | ~1.0 GB, 1.6 GB peak | ~0.8 GB |
+| LLMLingua + `gpt2` | ~1.0 GB, 1.5 GB peak | ~0.6 GB |
+| LLMLingua-2 xlm-roberta-large | ~2.5–3.5 GB (estimate) | ~1.5 GB (estimate) |
+| LLMLingua / LongLLMLingua + `phi-2` | **~11 GB on CPU** (fp32, 2.7B) | ~5.5 GB in fp16 |
+| LLMLingua / LongLLMLingua + Llama-2 7B | ~28 GB on CPU (fp32) | ~14 GB in fp16 |
+
+The default path is therefore a ~1.5 GB add-on, not a 32 GB requirement. Large
+figures come from the classic engines, whose default model is `phi-2`: a 6 GB
+GPU cannot hold it in fp16, so it falls back to fp32 on the CPU and takes ~11 GB.
+On a 32 GB machine that plus OpenCode and its plugins can reach the OOM killer.
+
+To keep the compressor inside a fixed budget:
+
+- Prefer **LLMLingua-2 bert-base** (default) or **`gpt2`** for the classic
+  engine. Both stay around 1–1.5 GB.
+- Set `"memoryLimitMB": 2048` (or `4096`/`8192`). The worker exits with code
+  137 when its RSS passes the budget, so the request fails with a clear message
+  instead of the kernel choosing OpenCode as the OOM victim.
+- Set `"idleMinutes": 5` to return the model's memory sooner after use.
+- `device: "cpu"` avoids the CUDA context (a few hundred MB of host memory plus
+  VRAM) at roughly half the speed on a small prompt.
+
+With the default engine, an 8 GB machine is comfortable and 4 GB is workable if
+OpenCode runs lean; with `phi-2` or Llama, no 4–8 GB budget will fit.
+
 ## Crashes, memory and "service is restarting"
 
 A local model is the only part of this plugin that can use several gigabytes.
@@ -187,6 +219,8 @@ OpenCode down with it:
 
 - The Python worker raises its own `oom_score_adj` to `800`, so the kernel kills
   the worker before OpenCode when RAM runs out.
+- With `memoryLimitMB` set, a watchdog stops the worker at that budget (exit
+  code 137) before the machine is under pressure at all.
 - Before loading a model the worker checks `/proc/meminfo` and refuses with a
   clear message when less than `minAvailableMB` is free; below 4 GB it warns.
 - Local compression is capped at 1 MB of input (about 100k tokens). Larger

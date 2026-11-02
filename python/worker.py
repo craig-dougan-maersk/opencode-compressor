@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -28,10 +29,16 @@ sys.stdout = sys.stderr  # keep library prints off the protocol channel
 
 # Loading a model in the worker must never get OpenCode itself killed. The OOM
 # killer picks the process with the highest score; this child is expendable.
-try:
-    MIN_AVAILABLE_MB = int(os.environ.get("LLMLINGUA_MIN_AVAILABLE_MB", "800"))
-except ValueError:
-    MIN_AVAILABLE_MB = 800
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+MIN_AVAILABLE_MB = env_int("LLMLINGUA_MIN_AVAILABLE_MB", 800)
+# 0 disables the budget; otherwise the worker exits when its own RSS exceeds it.
+MAX_RSS_MB = env_int("LLMLINGUA_MAX_RSS_MB", 0)
 
 _compressor: Any = None
 _compressor_key: tuple | None = None
@@ -72,6 +79,31 @@ def available_memory_mb() -> int | None:
     return None
 
 
+def current_rss_mb() -> int | None:
+    """This process's resident set size, in MB, when /proc is available."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def watch_memory() -> None:
+    """Stop the worker at its memory budget instead of starving the machine."""
+    while True:
+        rss = current_rss_mb()
+        if rss is not None and rss > MAX_RSS_MB:
+            try:
+                status(f"Memory budget of {MAX_RSS_MB} MB exceeded ({rss} MB in use); stopping the worker.")
+            finally:
+                # Hard exit: the model is already resident, so unwinding is unsafe.
+                os._exit(137)
+        time.sleep(0.25)
+
+
 def resolve_device(device: str) -> str:
     if device and device != "auto":
         return device
@@ -110,6 +142,11 @@ def load(params: dict) -> Any:
         pass
 
     available = available_memory_mb()
+    if MAX_RSS_MB > 0 and available is not None and available < MAX_RSS_MB:
+        raise RuntimeError(
+            f"Only {available} MB of RAM is available but the compressor memory budget is {MAX_RSS_MB} MB. "
+            "Lower memoryLimitMB, close some applications, or use the cloud engine."
+        )
     if available is not None and available < MIN_AVAILABLE_MB:
         raise RuntimeError(
             f"Only {available} MB of RAM is available; the local compressor needs more than {MIN_AVAILABLE_MB} MB. "
@@ -252,6 +289,8 @@ METHODS = {
 
 def main() -> None:
     prefer_being_killed()
+    if MAX_RSS_MB > 0:
+        threading.Thread(target=watch_memory, name="memory-watch", daemon=True).start()
     send({"event": "ready", "pid": os.getpid()})
     for line in sys.stdin:
         line = line.strip()

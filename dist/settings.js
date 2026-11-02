@@ -14,7 +14,7 @@ export const LLMLINGUA_MODELS = [
     {
         id: "microsoft/phi-2",
         title: "Phi-2 (2.7B)",
-        description: "Good small causal LM (~5.5 GB). Needs ~6 GB VRAM on GPU, or CPU.",
+        description: "Good small causal LM: ~5.5 GB on a GPU, but ~11 GB in fp32 on CPU. Large for a 6 GB card.",
     },
     {
         id: "openai-community/gpt2",
@@ -24,7 +24,7 @@ export const LLMLINGUA_MODELS = [
     {
         id: "NousResearch/Llama-2-7b-hf",
         title: "Llama-2 7B",
-        description: "LLMLingua's original default (~13 GB). Large GPU required.",
+        description: "LLMLingua's original default: ~14 GB in fp16, ~28 GB on CPU. Large GPU required.",
     },
     {
         id: "TheBloke/Llama-2-7b-Chat-GPTQ",
